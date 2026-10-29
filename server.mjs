@@ -54,7 +54,12 @@ const server = createServer(async (req, res) => {
   if (req.method === 'GET' && req.url === '/health') return send(200, { ok: true })
 
   if (req.method !== 'POST' || !req.url.startsWith('/mux')) return send(404, { error: 'not_found' })
-  if (TOKEN && req.headers.authorization !== `Bearer ${TOKEN}`) return send(401, { error: 'unauthorized' })
+  // 允许两种带法：Authorization: Bearer <token>，或 ?token=<token>（Worker 侧不用改代码就能带上）
+  const url = new URL(req.url, 'http://localhost')
+  const queryToken = url.searchParams.get('token') || ''
+  if (TOKEN && req.headers.authorization !== `Bearer ${TOKEN}` && queryToken !== TOKEN) {
+    return send(401, { error: 'unauthorized' })
+  }
 
   let raw = ''
   for await (const chunk of req) raw += chunk
