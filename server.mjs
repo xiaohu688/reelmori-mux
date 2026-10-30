@@ -1,6 +1,6 @@
 // 最小合轨服务：接两个 URL，用 ffmpeg 合轨，上传到 EvoLink 文件服务，返回公网 URL。
 // 契约（来自 airapvideo src/server/jobs.ts）：
-//   POST /mux { videoUrl, audioUrl, audioDurationSeconds, videoDurationSeconds, requireExactDuration, noShortest }
+//   POST /mux { videoUrl, audioUrl, audioStartSeconds?, audioDurationSeconds?, videoDurationSeconds?, requireExactDuration?, noShortest? }
 //   → { url, audioDurationSeconds, videoDurationSeconds, durationDeltaSeconds }
 import { createServer } from 'node:http'
 import { execFile } from 'node:child_process'
@@ -67,23 +67,51 @@ const server = createServer(async (req, res) => {
   try { body = JSON.parse(raw) } catch { return send(400, { error: 'invalid_json' }) }
 
   const { videoUrl, audioUrl } = body || {}
-  if (!videoUrl || !audioUrl) return send(400, { error: 'videoUrl_audioUrl_required' })
+  if (!audioUrl) return send(400, { error: 'audioUrl_required' })
+  // 只要音频、不要视频 = 截取一段音频（Suno 出的是整首歌，我们要 12 秒窗口）
+  const sliceOnly = !videoUrl
+  const audioStart = Number(body?.audioStartSeconds || 0)
+  const requestedAudio = Number(body?.audioDurationSeconds || 0)
+  if (!sliceOnly && !videoUrl) return send(400, { error: 'videoUrl_audioUrl_required' })
+  if (sliceOnly && !(requestedAudio > 0)) return send(400, { error: 'audioDurationSeconds_required' })
+  if (!Number.isFinite(audioStart) || audioStart < 0) return send(400, { error: 'invalid_audioStartSeconds' })
 
   const dir = await mkdtemp(join(tmpdir(), 'mux-'))
   try {
     const vPath = join(dir, 'video.mp4')
     const aPath = join(dir, 'audio.mp3')
     const outPath = join(dir, 'out.mp4')
+    if (sliceOnly) {
+      await download(audioUrl, aPath)
+      const fullDur = await probe(aPath, 'format=duration')
+      const start = Math.min(audioStart, Math.max(0, fullDur - 0.5))
+      const take = Math.min(requestedAudio, Math.max(0, fullDur - start))
+      if (!(take > 0)) return send(422, { error: 'audio_window_out_of_range', audioDurationSeconds: fullDur })
+      const clipPath = join(dir, 'clip.m4a')
+      await run('ffmpeg', [
+        '-y', '-v', 'error',
+        '-ss', String(start.toFixed(3)), '-t', String(take.toFixed(3)),
+        '-i', aPath, '-vn', '-c:a', 'aac', '-b:a', '160k',
+        clipPath,
+      ])
+      const clipDur = await probe(clipPath, 'format=duration')
+      const url = await uploadToEvolink(clipPath)
+      return send(200, { url, audioUrl: url, audioDurationSeconds: clipDur, audioStartSeconds: start })
+    }
+
     await Promise.all([download(videoUrl, vPath), download(audioUrl, aPath)])
 
     const vDur = await probe(vPath, 'format=duration')
-    const aDur = await probe(aPath, 'format=duration')
+    const fullAudioDur = await probe(aPath, 'format=duration')
+    const start = Math.min(audioStart, Math.max(0, fullAudioDur - 0.5))
+    const aDur = Math.max(0, fullAudioDur - start)
     const target = Math.min(vDur, aDur) === aDur ? aDur : vDur
 
     // 不加 -shortest：按较短者对齐，另一条用 -t 截到同一长度，避免半句话被切在末尾之外
     await run('ffmpeg', [
       '-y', '-v', 'error',
-      '-i', vPath, '-i', aPath,
+      '-i', vPath,
+      '-ss', String(start.toFixed(3)), '-i', aPath,
       '-map', '0:v:0', '-map', '1:a:0',
       '-c:v', 'copy', '-c:a', 'aac', '-b:a', '160k',
       '-t', String(Math.min(vDur, aDur).toFixed(3)),
@@ -101,6 +129,7 @@ const server = createServer(async (req, res) => {
       outputUrl: url,
       audioDurationSeconds: aDur,
       videoDurationSeconds: vDur,
+      audioStartSeconds: start,
       durationDeltaSeconds: delta,
     })
   } catch (error) {
